@@ -26,7 +26,7 @@
 ## 安装
 
 ```bash
-git clone <本仓库> ~/.claude/skills/claude-desktop-zh
+git clone https://github.com/liutingqi/claude-desktop-zh.git ~/.claude/skills/claude-desktop-zh
 ```
 
 ## 用法
