@@ -10,11 +10,15 @@
 
 所以：
 
-- 改这个 manifest 的 `description` → 菜单悬浮提示变化 ✅
+- 改这个 manifest 的 `description` → **内置 6 个技能**的悬浮提示变化 ✅
 - 改 `cowork_plugins/cache/**/SKILL.md` → 菜单**毫无变化** ❌
 
 `manifest.json` 结构：`{"skills": [{"name","description","tier":"always"}, ...]}`，共 6 条
 （docx、pdf、pdf-reading、pptx、xlsx、frontend-design）。
+
+剩下 90 多个插件技能的描述来自插件系统，与这份 manifest 无关。两条来源最终都汇成
+菜单项对象的 `skillDescription` 字段——所以**改渲染代码是唯一一处就能覆盖全部技能的办法**
+（见第 2 节的第二处注入），比逐处追数据源省事得多。
 
 ## 2. 菜单行的渲染代码
 
@@ -52,6 +56,37 @@ className:"min-w-0 truncate",children:s(j,{text:t.label,query:v,highlightClassNa
 2. 标签表里以菜单显示名为键；
 3. 兜底：描述第一行含中文且 ≤ 20 字符时直接用该行。
 
+### 第二处注入：悬浮气泡里的中文概要
+
+气泡由**同一个文件**里的 `SlashCommandMenuPopupBody`（`function Y()`）渲染，
+所以不用去别处找数据源。取值点只有一句：
+
+```js
+let{items:e,activeIndex:t,...}=O(),d=T(),m=D(),_=e[t],y=_?.type==="skill"?_:null,
+    b=y?y.skillDescription:_&&"subtitle"in _?_.subtitle:void 0,   // ← 锚点
+    x=b||y?.sourcePluginName||y?.sourceRepo?_:null,...
+...
+children:x&&s(N,{description:b,sourcePluginName:y?.sourcePluginName,sourceRepo:y?.sourceRepo,query:r})
+```
+
+锚点：`b=y?y.skillDescription:_&&"subtitle"in _?_.subtitle:void 0,`（全目录唯一）。
+
+**两个坑（第二个只有跑起来才会暴露）：**
+
+1. 它在 `let` 声明列表里，所以替换结果必须是**单个表达式**——不能写成
+   `b=...,b=...`，`let` 声明列表里重复声明同名绑定是 SyntaxError。
+2. 更不能在新表达式里读写 `b`（例如把 `b=...` 整条当参数传进去）。`b` 此刻还在 TDZ 里，
+   运行时会抛 `ReferenceError`，整个菜单直接崩——**而 `node --check` 是过得去的**
+   （语法合法），只有真的执行到那一行才发现。所以原表达式要作为参数整体传入：
+   `b=((_d,_b)=>{...})({概要表}, y?y.skillDescription:_&&"subtitle"in _?_.subtitle:void 0)`。
+
+同一函数里还有 `x=b||y?.sourcePluginName||y?.sourceRepo?_:null` 决定气泡显不显示，
+描述为空时返回原值即可保持原行为。
+
+解析顺序与短标签一致；命中后返回 `概要 + "\n" + 原文`。原文首行已含中文（内置技能的
+描述此前被 `localize_bundled_skills.py` 改过）或不是字符串时**原样返回**，避免中文叠两层、
+以及把 react-intl 描述符拼成 `[object Object]`。
+
 ## 3. 为什么 `/` 菜单里不会有「同名重复」
 
 聚合逻辑在 `ce1dac304-*.js`：合并 4 个来源后用 `uniqBy`（`shared-104-*.js` 的 `jd`/`tp`）去重，
@@ -64,14 +99,23 @@ className:"min-w-0 truncate",children:s(j,{text:t.label,query:v,highlightClassNa
 
 ## 4. 验证做法
 
-- 语法：把改完的 JS 拷成 `.mjs`，`node --check`。
+**先试跑，再落盘**——脚本在真正写入前会把注入结果拼好，务必走完前两步：
+
+- 语法：把改完的 JS 拷成 `.mjs`，`node --check`。**注意这一步查不出 TDZ 问题**（见第 2 节坑 2）。
 - 逻辑：把 `/*zh-skill-label*/` 到 `,t)` 之间的片段抽出来，前面补一个
   `const s=(t,p)=>({tag:t,props:p})` 桩，末尾把 `,t)` 换成 `,o)`，用假菜单项跑一遍，
   检查中英文/超长/无映射各种输入。
-- 落盘：`codesign --verify` + `verify_electron_asar_integrity`。
+  气泡那段更简单：把 `/*zh-skill-desc*/` 与 `/*zh-skill-desc-end*/` 之间的内容抠出来，
+  去掉开头的 `b=` 和结尾的逗号，用 `new Function("y","_",'return ('+expr+')')` 直接调用，
+  覆盖「英文描述 / 已含中文的描述 / 表里没有的键 / 描述为 undefined / 描述不是字符串」五种输入。
+- 落盘：`codesign --verify --deep --strict` + `verify_electron_asar_integrity`。
+- 真实生效：退出并重开 Claude Desktop。气泡只在悬停**非第一行**时出现（原版逻辑）。
 
 ## 5. 备份与回滚
 
-- `localize_skill_menu.py` 首次注入前会在同目录写 `<chunk>.js.bak-zh-skilllabel`，
+- 备份放在 bundle **外面**的 `.app-backups/`（按 chunk 文件名存放，升级换了哈希名会自动清理），
   `--restore` 从它还原。
+- **不要**把备份放进 `.app/` 里：它会被 codesign 封进签名，之后删掉它就会报
+  "a sealed resource is missing or invalid"。早期版本就是这么干的（`.bak-zh-skilllabel`
+  放在同目录），脚本里保留了一段迁移逻辑把旧备份挪出来。
 - 早期手工改 `cowork_plugins` 留下的 `.bak-2026-10-16` 备份与本技能无关。
