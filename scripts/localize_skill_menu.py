@@ -191,6 +191,9 @@ def accept_unverified(text: str, source: Path) -> str:
 
     旧版备份无法事后补哈希，所以退而求其次做结构校验：不含补丁标记、菜单行锚点
     恰好出现一次。过不了就直接退出——宁可不改，也不拿来路不明的内容去覆盖已签名的 app。
+
+    **这是防手滑的合理性检查，不是安全边界**：攻击者要满足这两条毫无难度。
+    真正的防线是「不自动信任」——见 `read_original` 里 `trust_legacy` 的说明。
     """
     if LEGACY_MARKER in text:
         raise SystemExit(f"{source} 已经是打过补丁的内容，不能当原文用，中止。")
@@ -216,7 +219,7 @@ def store_backup(backup_dir: Path, name: str, text: str) -> None:
         save_index(backup_dir, index)
 
 
-def read_original(path: Path, backup_dir: Path) -> tuple[str, bool]:
+def read_original(path: Path, backup_dir: Path, trust_legacy: bool = False) -> tuple[str, bool]:
     """取回未打补丁的原始内容，返回 (原始内容, bundle 是否被改动)。
 
     信任顺序（从高到低）：
@@ -225,10 +228,14 @@ def read_original(path: Path, backup_dir: Path) -> tuple[str, bool]:
        （app 升级换了 chunk 内容之后就是这种情况）；
     2. `backup_dir` 里**带 sha256 记录且校验通过**的备份；
     3. 旧版遗留位置（技能目录的 `.app-backups/`、bundle 内的 `.bak-zh-skilllabel`）——
-       没有哈希可查，必须通过 `accept_unverified` 的结构校验才接受。
+       没有哈希可查，因此**默认不信任**，只在显式传了 `trust_legacy=True` 时才采用，
+       且仍要过 `accept_unverified` 的结构校验。
 
-    备份的最终去向是覆盖**已签名**的 app，所以这里从不「猜一个」：任何一步校验不过
-    都直接退出，而不是拿低可信来源顶上去。
+    第 3 条为什么不自动：那两处都在用户可写的范围内，而备份的最终去向是覆盖
+    **已签名**的 app——等于把「能写我 home 目录」升级成「代码进了我信任的签名 app」，
+    并且是持久的。更何况本脚本会从 SessionStart 钩子无人值守地跑：自动采用就等于
+    静默安装。所以默认中止并打印候选的路径与哈希，由人确认后加
+    `--trust-legacy-backup` 重跑（钩子场景下失败即安全）。
     """
     backup_dir.mkdir(parents=True, exist_ok=True)
     for private in (backup_dir.parent, backup_dir):
@@ -252,9 +259,36 @@ def read_original(path: Path, backup_dir: Path) -> tuple[str, bool]:
         return live, dirty
 
     # 已打过补丁：必须找到一份可信的原文。
-    for source in (stray, LEGACY_BACKUP_DIR / path.name):
-        if not source.exists():
-            continue
+    # 先查第 2 条（backup_dir 里带哈希记录的备份）——它是唯一被自动信任的来源。
+    # 这一步必须排在旧位置候选**前面**：旧目录里往往还留着迁移前的同名副本，
+    # 若反过来先看它，就会在新位置备份完全正常的情况下也无谓中止。
+    backup = backup_dir / path.name
+    expect = load_index(backup_dir).get(path.name)
+    if backup.exists() and expect:
+        text = backup.read_text(encoding="utf-8")
+        if sha256_text(text) != expect:
+            raise SystemExit(
+                f"{backup} 的 sha256 校验不通过（备份被改动或损坏），"
+                "拒绝用它重打补丁，中止。"
+            )
+        return text, False
+
+    # 新位置没有可用备份，才轮到旧位置——默认不信任，见 docstring 第 3 条。
+    legacy = [c for c in (stray, LEGACY_BACKUP_DIR / path.name) if c.exists()]
+    if legacy and not trust_legacy:
+        detail = "\n".join(
+            f"      {c}\n"
+            f"        sha256={sha256_text(c.read_text(encoding='utf-8'))}"
+            for c in legacy
+        )
+        raise SystemExit(
+            f"{path.name} 已打过补丁，但 {backup_dir} 里没有可校验的原文备份。\n"
+            f"  在旧位置找到候选，但它们没有哈希记录，脚本不自动信任：\n{detail}\n"
+            "  确认这些文件的来源可靠后，加 --trust-legacy-backup 重跑；\n"
+            "  否则请先重装 Claude，再重打补丁。"
+        )
+    if legacy:
+        source = legacy[0]
         text = accept_unverified(source.read_text(encoding="utf-8"), source)
         store_backup(backup_dir, path.name, text)
         if source == stray:
@@ -263,19 +297,15 @@ def read_original(path: Path, backup_dir: Path) -> tuple[str, bool]:
         print(f"  [迁移] 原文备份 {source} → {backup_dir / path.name}")
         return text, dirty
 
-    backup = backup_dir / path.name
+    # 既没有可校验的备份，也没有旧位置候选：明确说清是缺文件还是缺记录，不猜。
     if not backup.exists():
         raise SystemExit(
             f"{path.name} 已打过补丁，但在 {backup} 找不到原始备份，无法安全重打。"
         )
-    text = backup.read_text(encoding="utf-8")
-    expect = load_index(backup_dir).get(path.name)
-    if not expect or sha256_text(text) != expect:
-        raise SystemExit(
-            f"{backup} 的 sha256 校验不通过（备份被改动或损坏），"
-            "拒绝用它重打补丁，中止。"
-        )
-    return text, dirty
+    raise SystemExit(
+        f"{backup} 没有可校验的 sha256 记录（{INDEX_NAME} 缺失或未收录它），"
+        "无法确认备份没被改动，拒绝用它重打补丁，中止。"
+    )
 
 
 def prune_stale_backups(assets_dir: Path, backup_dir: Path) -> None:
@@ -315,9 +345,10 @@ def patch_frontend(
     labels: dict[str, str],
     summaries: dict[str, str],
     backup_dir: Path = BACKUP_DIR,
+    trust_legacy: bool = False,
 ) -> Path | None:
     path = find_target(assets_dir)
-    original, dirty = read_original(path, backup_dir)
+    original, dirty = read_original(path, backup_dir, trust_legacy)
 
     for name, anchor in (("短标签", ANCHOR), ("气泡概要", DESC_ANCHOR)):
         if original.count(anchor) != 1:
@@ -398,6 +429,12 @@ def main() -> int:
         help=f"中文概要表（悬浮气泡用），默认 {SUMMARY_FILE_NAME}",
     )
     ap.add_argument("--no-resign", action="store_true", help="只改文件，不重签名")
+    ap.add_argument(
+        "--trust-legacy-backup",
+        action="store_true",
+        help="把旧位置（技能目录内 / bundle 内）没有哈希记录的备份当作原文。"
+        "仅在确认过它的来源时使用；默认不信任，会中止并打印候选路径与哈希。",
+    )
     ap.add_argument("--restore", action="store_true", help="从备份还原菜单渲染代码并重签名")
     args = ap.parse_args()
 
@@ -427,7 +464,9 @@ def main() -> int:
             return 0
     else:
         print("1) 修改菜单渲染代码……")
-        changed = patch_frontend(assets_dir, labels, summaries)
+        changed = patch_frontend(
+            assets_dir, labels, summaries, trust_legacy=args.trust_legacy_backup
+        )
 
     if changed is None:
         print("无需改动。")

@@ -133,6 +133,15 @@ children:x&&s(N,{description:b,sourcePluginName:y?.sourcePluginName,sourceRepo:y
 3. 旧版遗留位置（`LEGACY_BACKUP_DIR`、bundle 内的 `.bak-zh-skilllabel`）——没有哈希可查，
    必须过 `accept_unverified` 的结构校验（不含补丁标记、`ANCHOR` 恰好出现一次）。
 
+**第 3 条默认不启用**：只有显式传 `--trust-legacy-backup` 才会走。不给开关时脚本中止，
+并打印候选路径 + 各自的 sha256 让人核对（钩子场景下中止 = 失败即安全，写入不会发生）。
+理由见上一段：旧位置用户可写，内容最终会进签名 app，而脚本会被 SessionStart 无人值守调用。
+
+**顺序不能反**（真机踩过）：第 2 条必须排在第 3 条**前面**。旧位置往往还留着迁移前的同名副本，
+若先看旧位置，就会在「新位置备份完好」的情况下也无谓中止。回归用例是 roundtrip 测试的第 12 项
+（合法备份 + 旧位置残留 → 必须走备份）——它是唯一能抓到该顺序问题的用例：把两条顺序换回来，
+1–11 全过、只有第 12 项中止。
+
 任何一步不过就 `SystemExit`，**不猜、不降级**。`--restore` 写回前同样先校验哈希。
 
 一个易踩的坑：删掉 bundle 内的旧备份等于动了**被封进签名的资源**，必须重签名，
