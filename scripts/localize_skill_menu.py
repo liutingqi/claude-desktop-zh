@@ -30,8 +30,14 @@
 注入块分别用 `/*zh-skill-label*/ … /*zh-skill-label-end*/` 和
 `/*zh-skill-desc*/ … /*zh-skill-desc-end*/` 成对标记包住，
 所以本脚本是**可重复执行**的：再跑一次会把整块换成新表，而不是跳过。
-原始版本备份放在 bundle **外面**（`.app-backups/`）——放在 bundle 里会被
-codesign 封进签名，之后删掉它就会报 "a sealed resource is missing or invalid"。
+
+原始版本备份放在 `~/Library/Application Support/claude-desktop-zh/.app-backups/`——
+**不能**放 bundle 里（会被 codesign 封进签名，之后删掉它就报
+"a sealed resource is missing or invalid"），也**不**放技能目录里：备份会被原样写回
+已签名的 app，其内容等于要执行的代码，属于可信输入，不该和会被同步/清理/分发的
+仓库文件混在一起。备份带 sha256 记录，重打补丁和 `--restore` 前都会校验；
+bundle 里的文件只要没打过补丁就优先拿它当原文（app 升级后正是这种情况），
+从源头避免依赖历史备份。详见 `read_original`。
 
 依赖
 ----
@@ -41,8 +47,8 @@ asar 读写 / ElectronAsarIntegrity 更新 / 重签名逻辑。用 --patch-scrip
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -75,8 +81,14 @@ DESC_END = "/*zh-skill-desc-end*/"
 LEGACY_MARKER = "zh-skill-label"  # 旧版只有起始标记，用 in 判断即可覆盖新版
 LEGACY_SUFFIX = ".bak-zh-skilllabel"  # 旧版把备份放在 bundle 内，已废弃
 
-# 备份目录：必须在 bundle 之外，否则会被签进签名。
-BACKUP_DIR = Path(__file__).resolve().parent.parent / ".app-backups"
+# 备份目录：两个「不能」——不能在 bundle 里（会被 codesign 封进签名），
+# 也不能留在 git 仓库里。备份会被原样写回**已签名**的 app，其内容等于要执行的代码，
+# 属于可信输入，不该和会被同步 / 清理 / 分发的仓库文件混在一处。改用用户私有目录。
+BACKUP_DIR = Path.home() / "Library/Application Support/claude-desktop-zh/.app-backups"
+# 早期版本用的位置（技能目录内的 .app-backups/）。只作为迁移来源读取，不再写入。
+LEGACY_BACKUP_DIR = Path(__file__).resolve().parent.parent / ".app-backups"
+# 备份的 sha256 记录；重打补丁与还原前都拿它确认备份没被改动过。
+INDEX_NAME = "index.json"
 
 
 def build_inject(labels: dict[str, str]) -> str:
@@ -150,29 +162,120 @@ def find_target(assets_dir: Path) -> Path:
     return hits[0]
 
 
-def read_original(path: Path, backup_dir: Path) -> tuple[str, bool]:
-    """取回未打补丁的原始内容，顺带迁移/清理旧备份。返回 (原始内容, bundle 是否被改动)。"""
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup = backup_dir / path.name
-    if backup.exists():
-        return backup.read_text(encoding="utf-8"), False
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    legacy = path.with_name(path.name + LEGACY_SUFFIX)
-    if legacy.exists():
-        # 旧版备份在 bundle 内：复制出来，再把 bundle 里那份删掉（它被签名封住了）。
-        text = legacy.read_text(encoding="utf-8")
-        backup.write_text(text, encoding="utf-8")
-        legacy.unlink()
-        print(f"  [迁移] 原始备份移出 bundle → {backup.relative_to(backup.parent.parent)}")
-        return text, True
 
-    text = path.read_text(encoding="utf-8")
+def load_index(backup_dir: Path) -> dict[str, str]:
+    """读备份的 sha256 记录；文件缺失或损坏时返回空表（当作「没有记录」处理）。"""
+    path = backup_dir / INDEX_NAME
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def save_index(backup_dir: Path, index: dict[str, str]) -> None:
+    path = backup_dir / INDEX_NAME
+    body = json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    path.write_text(body, encoding="utf-8")
+
+
+def accept_unverified(text: str, source: Path) -> str:
+    """校验一份**没有 sha256 记录**的旧备份确实还像「未打补丁的原文」。
+
+    旧版备份无法事后补哈希，所以退而求其次做结构校验：不含补丁标记、菜单行锚点
+    恰好出现一次。过不了就直接退出——宁可不改，也不拿来路不明的内容去覆盖已签名的 app。
+    """
     if LEGACY_MARKER in text:
+        raise SystemExit(f"{source} 已经是打过补丁的内容，不能当原文用，中止。")
+    hits = text.count(ANCHOR)
+    if hits != 1:
+        raise SystemExit(
+            f"{source} 里菜单行锚点出现 {hits} 次（应为 1），不像是 Claude 的前端文件，中止。"
+        )
+    return text
+
+
+def store_backup(backup_dir: Path, name: str, text: str) -> None:
+    """把原文写进备份目录并记录 sha256（内容没变就只补记录，不重复打印）。"""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / name
+    digest = sha256_text(text)
+    if not backup.exists() or backup.read_text(encoding="utf-8") != text:
+        backup.write_text(text, encoding="utf-8")
+        print(f"  [备份] 原文 → {backup}")
+    index = load_index(backup_dir)
+    if index.get(name) != digest:
+        index[name] = digest
+        save_index(backup_dir, index)
+
+
+def read_original(path: Path, backup_dir: Path) -> tuple[str, bool]:
+    """取回未打补丁的原始内容，返回 (原始内容, bundle 是否被改动)。
+
+    信任顺序（从高到低）：
+
+    1. **bundle 里当前的文件**——只要它没打过补丁，它就是原文，比任何备份都可信
+       （app 升级换了 chunk 内容之后就是这种情况）；
+    2. `backup_dir` 里**带 sha256 记录且校验通过**的备份；
+    3. 旧版遗留位置（技能目录的 `.app-backups/`、bundle 内的 `.bak-zh-skilllabel`）——
+       没有哈希可查，必须通过 `accept_unverified` 的结构校验才接受。
+
+    备份的最终去向是覆盖**已签名**的 app，所以这里从不「猜一个」：任何一步校验不过
+    都直接退出，而不是拿低可信来源顶上去。
+    """
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for private in (backup_dir.parent, backup_dir):
+        try:
+            private.chmod(0o700)  # 备份会成为 app 里要执行的代码，只给自己读写
+        except OSError:
+            pass
+
+    dirty = False
+    stray = path.with_name(path.name + LEGACY_SUFFIX)  # 旧版放在 bundle 内的备份
+    live = path.read_text(encoding="utf-8")
+
+    if LEGACY_MARKER not in live:
+        # 没打过补丁 ⇒ 当前文件本身就是原文，顺手刷新备份，完全不碰历史备份。
+        store_backup(backup_dir, path.name, live)
+        if stray.exists():
+            # 它是被 codesign 封住的资源，删掉就等于动了 bundle，必须重签名。
+            stray.unlink()
+            dirty = True
+            print(f"  [清理] 删除 bundle 内旧备份 {stray.name}")
+        return live, dirty
+
+    # 已打过补丁：必须找到一份可信的原文。
+    for source in (stray, LEGACY_BACKUP_DIR / path.name):
+        if not source.exists():
+            continue
+        text = accept_unverified(source.read_text(encoding="utf-8"), source)
+        store_backup(backup_dir, path.name, text)
+        if source == stray:
+            stray.unlink()
+            dirty = True
+        print(f"  [迁移] 原文备份 {source} → {backup_dir / path.name}")
+        return text, dirty
+
+    backup = backup_dir / path.name
+    if not backup.exists():
         raise SystemExit(
             f"{path.name} 已打过补丁，但在 {backup} 找不到原始备份，无法安全重打。"
         )
-    shutil.copy2(path, backup)  # 首次执行：当前内容就是原始内容
-    return text, False
+    text = backup.read_text(encoding="utf-8")
+    expect = load_index(backup_dir).get(path.name)
+    if not expect or sha256_text(text) != expect:
+        raise SystemExit(
+            f"{backup} 的 sha256 校验不通过（备份被改动或损坏），"
+            "拒绝用它重打补丁，中止。"
+        )
+    return text, dirty
 
 
 def prune_stale_backups(assets_dir: Path, backup_dir: Path) -> None:
@@ -183,10 +286,14 @@ def prune_stale_backups(assets_dir: Path, backup_dir: Path) -> None:
     if not backup_dir.exists():
         return
     live = {p.name for p in assets_dir.glob("*.js")}
+    index = load_index(backup_dir)
     for backup in sorted(backup_dir.iterdir()):
-        if backup.name not in live:
-            backup.unlink()
-            print(f"  [清理] 删除过期备份 {backup.name}（原文件已随升级消失）")
+        if backup.name == INDEX_NAME or backup.name in live:
+            continue
+        backup.unlink()
+        index.pop(backup.name, None)
+        print(f"  [清理] 删除过期备份 {backup.name}（原文件已随升级消失）")
+    save_index(backup_dir, index)
 
 
 def strip_blocks(text: str) -> str:
@@ -237,17 +344,29 @@ def patch_frontend(
 
 
 def restore_frontend(assets_dir: Path, backup_dir: Path = BACKUP_DIR) -> bool:
-    """把菜单渲染代码还原成插入前的版本（从 bundle 外的备份）。"""
+    """把菜单渲染代码还原成插入前的版本（从 bundle 外的备份）。
+
+    还原同样是「拿备份覆盖已签名的 app」，所以先用 sha256 确认备份没被动过，
+    再确认它确实还像个原始前端文件，两条都过了才写。
+    """
     if not backup_dir.exists():
         return False
     live = {p.name for p in assets_dir.glob("*.js")}
+    index = load_index(backup_dir)
     restored = False
     for backup in sorted(backup_dir.iterdir()):
-        if backup.name not in live:
+        if backup.name == INDEX_NAME or backup.name not in live:
             continue
-        target = assets_dir / backup.name
-        shutil.copy2(backup, target)
-        print(f"  [ok] 已还原 {target.name}")
+        text = backup.read_text(encoding="utf-8")
+        expect = index.get(backup.name)
+        if not expect or sha256_text(text) != expect:
+            raise SystemExit(
+                f"{backup} 的 sha256 校验不通过（备份被改动或损坏），"
+                "拒绝用它覆盖已签名的 app，中止。"
+            )
+        accept_unverified(text, backup)
+        (assets_dir / backup.name).write_text(text, encoding="utf-8")
+        print(f"  [ok] 已还原 {backup.name}")
         restored = True
     for legacy in sorted(assets_dir.glob("*" + LEGACY_SUFFIX)):
         legacy.unlink()

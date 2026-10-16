@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+# 旧版把备份放在这里（仓库内）；现已改到 ~/Library/Application Support/，这行留着防止
+# 老机器上遗留的目录被提交。
 .app-backups/
 .sync.log
 scripts/.skip-translate

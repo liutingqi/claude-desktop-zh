@@ -64,9 +64,17 @@ python3 "$D/sync_skill_labels.py" --apply        # 翻译缺失项 + 写表 + �
 python3 scripts/localize_skill_menu.py --restore   # 还原渲染代码并重签名
 ```
 
-首次改动前脚本把原始文件备份到 bundle **外面**的 `.app-backups/`
-（放进 bundle 里会被 codesign 封进签名，之后删掉它就会报
-"a sealed resource is missing or invalid"）。
+首次改动前脚本把原始文件备份到 `~/Library/Application Support/claude-desktop-zh/.app-backups/`
+（权限 0700）。这个位置的两个「不能」：
+
+- **不能放 bundle 里**——会被 codesign 封进签名，之后删掉它就会报
+  "a sealed resource is missing or invalid"；
+- **不能放技能目录里**——备份会被原样写回已签名的 app，其内容等于要执行的代码，
+  属于可信输入，不该和会被同步 / `git clean` / 分发的仓库文件混在一处。
+
+备份带 sha256 记录，重打补丁和 `--restore` 前都会校验，对不上就直接中止而不是照写。
+另外，只要 bundle 里的文件还没打过补丁（app 升级后就是这种情况），脚本就**优先拿它当原文**，
+不去依赖历史备份。
 
 ## 它是怎么做的
 

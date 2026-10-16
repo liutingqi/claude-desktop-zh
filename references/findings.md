@@ -113,9 +113,30 @@ children:x&&s(N,{description:b,sourcePluginName:y?.sourcePluginName,sourceRepo:y
 
 ## 5. 备份与回滚
 
-- 备份放在 bundle **外面**的 `.app-backups/`（按 chunk 文件名存放，升级换了哈希名会自动清理），
-  `--restore` 从它还原。
-- **不要**把备份放进 `.app/` 里：它会被 codesign 封进签名，之后删掉它就会报
+备份放在 `~/Library/Application Support/claude-desktop-zh/.app-backups/`（按 chunk 文件名存放，
+升级换了哈希名后由 `prune_stale_backups` 自动清理），`--restore` 从它还原。
+
+**位置为什么讲究**（2026-10-16 安全复查后调整）：备份的内容会被**原样写回已签名的 app**，
+等于要执行的代码，属于可信输入，所以两条都不能违反：
+
+- **不能放 `.app/` 里**：会被 codesign 封进签名，之后删掉它就报
   "a sealed resource is missing or invalid"。早期版本就是这么干的（`.bak-zh-skilllabel`
-  放在同目录），脚本里保留了一段迁移逻辑把旧备份挪出来。
-- 早期手工改 `cowork_plugins` 留下的 `.bak-2026-10-16` 备份与本技能无关。
+  放同目录），脚本里保留了迁移逻辑把旧备份挪出来。
+- **不能放技能目录里**：早期用的是技能目录内的 `.app-backups/`，但那在 git 仓库工作树里——
+  一个能被 `git clean -xdf` 清掉、能被同步、能被打包进分发的目录，不该同时是
+  「写进签名 app 的内容」的来源。现在只作为迁移来源读（`LEGACY_BACKUP_DIR`）。
+
+**信任链**（`read_original`，从高到低）：
+
+1. bundle 里当前的文件只要**没打过补丁**就是原文——app 升级后正是这种情况，直接用它；
+2. 备份目录里**带 sha256 记录且校验通过**的备份（`index.json`）；
+3. 旧版遗留位置（`LEGACY_BACKUP_DIR`、bundle 内的 `.bak-zh-skilllabel`）——没有哈希可查，
+   必须过 `accept_unverified` 的结构校验（不含补丁标记、`ANCHOR` 恰好出现一次）。
+
+任何一步不过就 `SystemExit`，**不猜、不降级**。`--restore` 写回前同样先校验哈希。
+
+一个易踩的坑：删掉 bundle 内的旧备份等于动了**被封进签名的资源**，必须重签名，
+所以 `read_original` 在那条路径上要返回 `dirty=True` 触发重签；否则「改了 bundle 却没重签」
+会让 app 起不来。只搬外部备份文件则不需要重签。
+
+早期手工改 `cowork_plugins` 留下的 `.bak-2026-10-16` 备份与本技能无关。
