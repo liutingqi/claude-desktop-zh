@@ -1,0 +1,10 @@
+{
+  "_comment": "键 = app.asar 里 resources/bundled-skills/manifest.json 的技能 name（必须保持英文，绝不能改）；值 = 中文摘要，会被放在英文原文之前。",
+
+  "docx": "Word 文档处理：创建、读取、编辑 .docx/.dotx 文档，含内容提取、插图、查找替换、修订与批注。",
+  "pdf": "PDF 处理：读写、合并拆分、旋转、水印、创建、填表、加解密、提取图片与 OCR。",
+  "pdf-reading": "PDF 阅读：读取、检查、提取 PDF 内容（文本/表格/图片/表单），选择合适阅读策略。",
+  "pptx": "PPT 演示文稿：创建、读取、编辑、合并拆分 .pptx/.potx 幻灯片与模板、备注、批注。",
+  "xlsx": "电子表格：读写、编辑、创建 .xlsx/.xlsm/.csv/.tsv，公式、格式化、图表与数据清洗。",
+  "frontend-design": "前端视觉设计：新界面或改造现有界面时的美学方向、排版与设计决策。"
+}
